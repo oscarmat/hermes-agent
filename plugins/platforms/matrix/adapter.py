@@ -1285,6 +1285,23 @@ class MatrixAdapter(BasePlatformAdapter):
             self._allowed_rooms: Set[str] = {
                 r.strip() for r in str(allowed_rooms_raw).split(",") if r.strip()
             }
+        # Senders whose messages only count as a mention when they address the
+        # bot explicitly (``m.mentions``, full MXID, or a matrix.to pill).  A
+        # bare word matching the bot localpart is NOT enough.  Intended for
+        # other bots: in normal prose a bot cannot reply to a peer without
+        # naming it ("Understood, <name>."), and with loose matching every
+        # such courtesy re-invokes the peer, which sustains a reply loop.
+        strict_senders_raw = config.extra.get("strict_mention_users")
+        if strict_senders_raw is None:
+            strict_senders_raw = os.getenv("MATRIX_STRICT_MENTION_USERS", "")
+        if isinstance(strict_senders_raw, list):
+            self._strict_mention_users: Set[str] = {
+                str(u).strip() for u in strict_senders_raw if str(u).strip()
+            }
+        else:
+            self._strict_mention_users: Set[str] = {
+                u.strip() for u in str(strict_senders_raw).split(",") if u.strip()
+            }
         self._allow_room_mentions: bool = os.getenv(
             "MATRIX_ALLOW_ROOM_MENTIONS", "false"
         ).lower() in ("true", "1", "yes")
@@ -3374,7 +3391,12 @@ class MatrixAdapter(BasePlatformAdapter):
         mention_user_ids = (
             mentions_block.get("user_ids") if isinstance(mentions_block, dict) else None
         )
-        is_mentioned = self._is_bot_mentioned(body, formatted_body, mention_user_ids)
+        is_mentioned = self._is_bot_mentioned(
+            body,
+            formatted_body,
+            mention_user_ids,
+            strict=sender in self._strict_mention_users,
+        )
 
         # Require-mention gating.
         if not is_dm:
@@ -4918,6 +4940,7 @@ class MatrixAdapter(BasePlatformAdapter):
         body: str,
         formatted_body: Optional[str] = None,
         mention_user_ids: Optional[list] = None,
+        strict: bool = False,
     ) -> bool:
         """Return True if the bot is mentioned in the message.
 
@@ -4927,6 +4950,13 @@ class MatrixAdapter(BasePlatformAdapter):
         body text does not contain an explicit ``@bot`` string (some clients
         only render mention "pills" in ``formatted_body`` or use display
         names).
+
+        ``strict`` drops the bare-localpart heuristic, so only an explicit
+        address counts.  ``_strip_mention`` already refuses to treat a bare
+        word as a mention token (it would turn "Hermes Agent" into "Agent");
+        strict mode makes detection agree with stripping for senders where
+        the loose match causes more harm than good — see
+        ``strict_mention_users``.
         """
         # m.mentions.user_ids — authoritative per MSC3952 / Matrix v1.7.
         if mention_user_ids and self._user_id and self._user_id in mention_user_ids:
@@ -4935,7 +4965,7 @@ class MatrixAdapter(BasePlatformAdapter):
             return False
         if self._user_id and self._user_id in body:
             return True
-        if self._user_id and ":" in self._user_id:
+        if not strict and self._user_id and ":" in self._user_id:
             localpart = self._user_id.split(":")[0].lstrip("@")
             if localpart and re.search(
                 r"\b" + re.escape(localpart) + r"\b", body, re.IGNORECASE
