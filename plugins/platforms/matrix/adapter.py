@@ -793,6 +793,13 @@ class MatrixAdapter(BasePlatformAdapter):
         self._free_rooms: Set[str] = _extra_csv_set(config, "free_response_rooms", "MATRIX_FREE_RESPONSE_ROOMS")
         # If non-empty, bot ONLY responds in these rooms (whitelist); DMs exempt.
         self._allowed_rooms: Set[str] = _extra_csv_set(config, "allowed_rooms", "MATRIX_ALLOWED_ROOMS")
+        # Senders whose messages only count as a mention when they address the
+        # bot explicitly (``m.mentions``, full MXID, or a matrix.to pill).  A
+        # bare word matching the bot localpart is NOT enough.  Intended for
+        # other bots: in normal prose a bot cannot reply to a peer without
+        # naming it ("Understood, <name>."), and with loose matching every
+        # such courtesy re-invokes the peer, which sustains a reply loop.
+        self._strict_mention_users: Set[str] = _extra_csv_set(config, "strict_mention_users", "MATRIX_STRICT_MENTION_USERS")
         self._allow_room_mentions: bool = _env_truthy("MATRIX_ALLOW_ROOM_MENTIONS", "false")
         self._auto_thread: bool = _env_truthy("MATRIX_AUTO_THREAD", "true")
         self._dm_auto_thread: bool = _env_truthy("MATRIX_DM_AUTO_THREAD", "false")
@@ -1931,7 +1938,8 @@ class MatrixAdapter(BasePlatformAdapter):
         formatted_body = source_content.get("formatted_body")
         mentions_block = source_content.get("m.mentions") or {}  # MSC3952: authoritative signal
         mention_user_ids = mentions_block.get("user_ids") if isinstance(mentions_block, dict) else None
-        is_mentioned = self._is_bot_mentioned(body, formatted_body, mention_user_ids)
+        is_mentioned = self._is_bot_mentioned(
+            body, formatted_body, mention_user_ids, strict=sender in self._strict_mention_users)
         if not is_dm:
             # Whitelist first: non-listed rooms are dropped even when @mentioned (DMs exempt).
             if self._allowed_rooms and room_id not in self._allowed_rooms:
@@ -2697,9 +2705,28 @@ class MatrixAdapter(BasePlatformAdapter):
         return protected, placeholders
 
     def _is_bot_mentioned(
-        self, body: str, formatted_body: Optional[str] = None, mention_user_ids: Optional[list] = None) -> bool:
-        """True if the bot is mentioned; ``m.mentions.user_ids`` (MSC3952) is authoritative
-        even when the body has no ``@bot`` text (pills may live only in formatted_body)."""
+        self,
+        body: str,
+        formatted_body: Optional[str] = None,
+        mention_user_ids: Optional[list] = None,
+        strict: bool = False,
+    ) -> bool:
+        """Return True if the bot is mentioned in the message.
+
+        Per MSC3952, ``m.mentions.user_ids`` is the authoritative mention
+        signal in the Matrix spec.  When the sender's client populates that
+        field with the bot's user-id, we trust it — even when the visible
+        body text does not contain an explicit ``@bot`` string (some clients
+        only render mention "pills" in ``formatted_body`` or use display
+        names).
+
+        ``strict`` drops the bare-localpart heuristic, so only an explicit
+        address counts.  ``_strip_mention`` already refuses to treat a bare
+        word as a mention token (it would turn "Hermes Agent" into "Agent");
+        strict mode makes detection agree with stripping for senders where
+        the loose match causes more harm than good — see
+        ``strict_mention_users``.
+        """
         if mention_user_ids and self._user_id and self._user_id in mention_user_ids:
             return True
         if not body and not formatted_body:
@@ -2707,7 +2734,7 @@ class MatrixAdapter(BasePlatformAdapter):
         if self._user_id and self._user_id in body:
             return True
         localpart = self._user_localpart()
-        if localpart and re.search(r"\b" + re.escape(localpart) + r"\b", body, re.IGNORECASE):
+        if not strict and localpart and re.search(r"\b" + re.escape(localpart) + r"\b", body, re.IGNORECASE):
             return True
         return bool(formatted_body and self._user_id and f"matrix.to/#/{self._user_id}" in formatted_body)
 
