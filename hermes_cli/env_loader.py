@@ -111,7 +111,27 @@ def _env_keys_defined_in_dotenv(path: Path) -> set[str]:
     return keys
 
 
-def _clear_known_keys_missing_from_dotenv(path: Path) -> None:
+def _shared_env_path(home_path: Path) -> Path:
+    """Return the install-wide ``shared.env`` that applies to ``home_path``.
+
+    Profiles live at ``<root>/profiles/<name>`` but the secrets they share
+    with the root install (provider API keys, platform tokens) live in
+    ``<root>/shared.env`` — one file to rotate instead of one per profile.
+    For a non-profile home the root is the home itself.
+
+    Mirrors the ``<root>/profiles/<name>`` detection in
+    ``hermes_constants.get_default_hermes_root``, but derives the root from
+    the caller-supplied path rather than ``HERMES_HOME``: multiplex gateways
+    call ``load_hermes_dotenv()`` for a profile that is not the process home.
+    """
+    if home_path.parent.name == "profiles":
+        return home_path.parent.parent / "shared.env"
+    return home_path / "shared.env"
+
+
+def _clear_known_keys_missing_from_dotenv(
+    path: Path, shared_path: Path | None = None
+) -> None:
     """Remove inherited profile-managed Hermes keys absent from ``.env``.
 
     After the profile's ``.env`` has been loaded with ``override=True``,
@@ -136,10 +156,16 @@ def _clear_known_keys_missing_from_dotenv(path: Path) -> None:
 
     Does **not** run when the ``.env`` file does not exist (bare-profile
     case, which follows ``#66930`` / ``#67027`` semantics).
+
+    ``shared_path`` (the install-wide ``shared.env``, when present) counts as
+    a definition site too: a key the operator deliberately set there was just
+    loaded into the environment, so treating it as "absent" would delete it.
     """
     if not path.exists():
         return
     defined = _env_keys_defined_in_dotenv(path)
+    if shared_path is not None and shared_path.exists():
+        defined |= _env_keys_defined_in_dotenv(shared_path)
     for key in _PROFILE_MANAGED_ENV_KEYS:
         if key not in defined and key in os.environ:
             del os.environ[key]
@@ -207,6 +233,11 @@ def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
             for name, value in os.environ.items()
             if _is_global_env(name)
         }
+        # Same precedence as load_hermes_dotenv(): install-wide shared.env
+        # underneath, the profile's own .env on top.
+        shared_env = _shared_env_path(home)
+        if shared_env.exists():
+            local_env.update(load_env_file(shared_env))
         local_env.update(load_env_file(home / ".env"))
         # Mirror load_hermes_dotenv()'s .op.env bootstrap: the 1Password
         # service-account token lives in <home>/.op.env (gitignored), not
@@ -476,6 +507,9 @@ def load_hermes_dotenv(
     """Load Hermes environment files with user config taking precedence.
 
     Behavior:
+    - `~/.hermes/shared.env`, when present, supplies secrets shared by the
+      root install and every profile under it. Loaded first so the home's own
+      `.env` wins on conflicts.
     - `~/.hermes/.env` overrides stale shell-exported values when present.
     - project `.env` acts as a dev fallback and only fills missing values when
       the user env exists.
@@ -488,20 +522,34 @@ def load_hermes_dotenv(
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
     user_env = home_path / ".env"
+    shared_env = _shared_env_path(home_path)
     project_env_path = Path(project_env) if project_env else None
 
     # Normalize safe formatting and remove invalid NUL bytes before parsing.
+    if shared_env.exists():
+        _sanitize_env_file_if_needed(shared_env)
     if user_env.exists():
         _sanitize_env_file_if_needed(user_env)
     if project_env_path and project_env_path.exists():
         _sanitize_env_file_if_needed(project_env_path)
 
-    if user_env.exists():
+    # Shared secrets load BEFORE the home's own .env so a profile can
+    # override any inherited value, and with override=True for the same
+    # reason .env uses it: a stale shell export must not win over the file
+    # the operator actually maintains. Deployments that inject shared.env
+    # some other way (systemd EnvironmentFile=, `op run`) still work — the
+    # values simply get re-applied identically.
+    if shared_env.exists():
+        _load_dotenv_with_fallback(shared_env, override=True)
+        loaded.append(shared_env)
+
+    user_env_loaded = user_env.exists()
+    if user_env_loaded:
         _load_dotenv_with_fallback(user_env, override=True)
         loaded.append(user_env)
         # Mirror reload_env() known-key cleanup so inherited Hermes keys
         # absent from this profile's .env do not leak into the runtime.
-        _clear_known_keys_missing_from_dotenv(user_env)
+        _clear_known_keys_missing_from_dotenv(user_env, shared_env)
 
     # Load .op.env AFTER .env so that .env values win, but the bootstrap
     # token (OP_SERVICE_ACCOUNT_TOKEN) becomes available for
@@ -518,7 +566,10 @@ def load_hermes_dotenv(
         _load_dotenv_with_fallback(op_env, override=False)
 
     if project_env_path and project_env_path.exists():
-        _load_dotenv_with_fallback(project_env_path, override=not loaded)
+        # Overrides stale shell vars only when the user env is absent — keyed
+        # on the user env specifically, not on `loaded`, so a present
+        # shared.env does not silently demote the project .env to fill-only.
+        _load_dotenv_with_fallback(project_env_path, override=not user_env_loaded)
         loaded.append(project_env_path)
 
     # External secret sources are skipped in two updater situations:
