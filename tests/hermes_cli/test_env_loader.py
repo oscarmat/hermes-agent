@@ -440,3 +440,135 @@ def test_other_profile_home_does_not_bridge_process_config(tmp_path, monkeypatch
 
     # The other profile's .env value stands; the process config was not applied.
     assert os.getenv("TERMINAL_ENV") == "docker"
+
+
+# ---------------------------------------------------------------------------
+# Install-wide shared.env
+#
+# Secrets shared by the root install and every profile under it live in
+# <root>/shared.env, so they can be rotated in one file. Only consumers that
+# inject it themselves (systemd EnvironmentFile=) used to see it; anything
+# invoking Hermes directly (CLI, `cron run`, subprocesses that inherit no
+# shell state) started with those variables unset.
+# ---------------------------------------------------------------------------
+
+
+def test_shared_env_is_loaded_for_a_root_home(tmp_path, monkeypatch):
+    """shared.env alone (no .env) still populates the environment."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / "shared.env").write_text("SHARED_ONLY_KEY=from_shared\n", encoding="utf-8")
+
+    monkeypatch.delenv("SHARED_ONLY_KEY", raising=False)
+
+    loaded = load_hermes_dotenv(hermes_home=home)
+
+    assert os.getenv("SHARED_ONLY_KEY") == "from_shared"
+    assert home / "shared.env" in loaded
+
+
+def test_home_env_overrides_shared_env(tmp_path, monkeypatch):
+    """The home's own .env wins over the shared file on conflicts."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / "shared.env").write_text(
+        "OVERLAP_KEY=from_shared\nONLY_SHARED=kept\n", encoding="utf-8"
+    )
+    (home / ".env").write_text("OVERLAP_KEY=from_home\n", encoding="utf-8")
+
+    monkeypatch.delenv("OVERLAP_KEY", raising=False)
+    monkeypatch.delenv("ONLY_SHARED", raising=False)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.getenv("OVERLAP_KEY") == "from_home"
+    # Non-conflicting shared values survive the .env load.
+    assert os.getenv("ONLY_SHARED") == "kept"
+
+
+def test_profile_home_reads_shared_env_from_the_root(tmp_path, monkeypatch):
+    """A profile at <root>/profiles/<name> inherits <root>/shared.env.
+
+    The shared file deliberately does NOT live inside the profile directory —
+    that is the whole point of sharing it.
+    """
+    root = tmp_path / "hermes"
+    profile = root / "profiles" / "coder"
+    profile.mkdir(parents=True)
+    (root / "shared.env").write_text("ROOT_SHARED_KEY=inherited\n", encoding="utf-8")
+    (profile / ".env").write_text("PROFILE_KEY=own\n", encoding="utf-8")
+
+    monkeypatch.delenv("ROOT_SHARED_KEY", raising=False)
+    monkeypatch.delenv("PROFILE_KEY", raising=False)
+
+    load_hermes_dotenv(hermes_home=profile)
+
+    assert os.getenv("ROOT_SHARED_KEY") == "inherited"
+    assert os.getenv("PROFILE_KEY") == "own"
+
+
+def test_shared_env_overrides_a_stale_shell_export(tmp_path, monkeypatch):
+    """Same rationale as .env: the maintained file beats a stale export."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / "shared.env").write_text("STALE_KEY=from_shared\n", encoding="utf-8")
+
+    monkeypatch.setenv("STALE_KEY", "from_shell")
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.getenv("STALE_KEY") == "from_shared"
+
+
+def test_shared_env_does_not_demote_project_env(tmp_path, monkeypatch):
+    """With no user .env, the project .env still overrides stale shell vars.
+
+    Regression guard: the project-env override used to key off "anything
+    loaded", so a present shared.env would silently turn the project .env
+    into fill-only.
+    """
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / "shared.env").write_text("UNRELATED_SHARED=x\n", encoding="utf-8")
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    project_env = project_dir / ".env"
+    project_env.write_text("PROJECT_KEY=from_project\n", encoding="utf-8")
+
+    monkeypatch.setenv("PROJECT_KEY", "from_stale_shell")
+    monkeypatch.delenv("UNRELATED_SHARED", raising=False)
+
+    load_hermes_dotenv(hermes_home=home, project_env=project_env)
+
+    assert os.getenv("PROJECT_KEY") == "from_project"
+
+
+def test_shared_env_absent_is_a_no_op(tmp_path, monkeypatch):
+    """No shared.env: behavior is exactly what it was before."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / ".env").write_text("PLAIN_KEY=value\n", encoding="utf-8")
+
+    monkeypatch.delenv("PLAIN_KEY", raising=False)
+
+    loaded = load_hermes_dotenv(hermes_home=home)
+
+    assert os.getenv("PLAIN_KEY") == "value"
+    assert loaded == [home / ".env"]
+
+
+def test_shared_env_path_resolution():
+    """<root>/profiles/<name> resolves to the root; anything else to itself."""
+    from pathlib import Path
+
+    from hermes_cli.env_loader import _shared_env_path
+
+    root = Path("/opt/data")
+    assert _shared_env_path(root) == root / "shared.env"
+    assert _shared_env_path(root / "profiles" / "coder") == root / "shared.env"
+    # A directory that merely happens to be named like a profile is not one.
+    assert (
+        _shared_env_path(root / "not_profiles" / "coder")
+        == root / "not_profiles" / "coder" / "shared.env"
+    )
