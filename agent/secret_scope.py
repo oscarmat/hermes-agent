@@ -370,13 +370,22 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
 
 
 def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
-    """Build a profile's secret mapping from ``<home>/.env`` plus its external
-    secret sources. Global vars are NOT copied in — ``get_secret`` reads those
-    from ``os.environ`` — so the scope holds only profile secrets."""
-    secrets = load_env_file(Path(hermes_home) / ".env")
+    """Build a profile's secret mapping from install-wide ``shared.env``, then
+    ``<home>/.env`` on top, plus external secret sources. Global vars are NOT
+    copied in — ``get_secret`` reads those from ``os.environ`` — so the scope
+    holds only profile secrets.
+
+    ``shared.env`` mirrors ``load_hermes_dotenv()``'s precedence: a routed
+    profile under the multiplex gateway never runs that loader, so without
+    this a shared.env-only value (MATRIX_HOMESERVER, ...) is invisible to
+    every profile but the one the process itself was launched as."""
+    hermes_home = Path(hermes_home)
+    from hermes_cli.env_loader import _shared_env_path
+    secrets = load_env_file(_shared_env_path(hermes_home))
+    secrets.update(load_env_file(hermes_home / ".env"))
     try:
         from hermes_cli.env_loader import get_secret_source_values
-        external_secrets = get_secret_source_values(Path(hermes_home))
+        external_secrets = get_secret_source_values(hermes_home)
     except Exception:
         external_secrets = {}
     secrets.update((k, v) for k, v in external_secrets.items() if not _is_global_env(k))
