@@ -423,6 +423,29 @@ class TestEnvFileParsing:
 
         assert ss.build_profile_secret_scope(profile) == {}
 
+    def test_build_profile_secret_scope_includes_shared_env(self, tmp_path):
+        """A routed profile under multiplex never runs load_hermes_dotenv(), so
+        build_profile_secret_scope() is the only path that reaches shared.env —
+        layered in with the profile's own .env winning on conflicts, mirroring
+        load_hermes_dotenv()'s precedence."""
+        (tmp_path / "shared.env").write_text(
+            "SHARED_ONLY=from_shared\nOVERLAP=from_shared\n"
+        )
+        (tmp_path / ".env").write_text("OVERLAP=from_profile\n")
+        assert ss.build_profile_secret_scope(tmp_path) == {
+            "SHARED_ONLY": "from_shared",
+            "OVERLAP": "from_profile",
+        }
+
+    def test_build_profile_secret_scope_reads_shared_env_from_profile_root(
+        self, tmp_path
+    ):
+        root = tmp_path / "hermes"
+        profile = root / "profiles" / "coder"
+        profile.mkdir(parents=True)
+        (root / "shared.env").write_text("ROOT_SHARED=inherited\n")
+        assert ss.build_profile_secret_scope(profile) == {"ROOT_SHARED": "inherited"}
+
 
 class TestApiServerListenerGlobals:
     """API_SERVER listener settings are deployment config (#69379), not
