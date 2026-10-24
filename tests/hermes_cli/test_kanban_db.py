@@ -469,6 +469,32 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kbd.check_respawn_guard(conn, tid) is None
 
 
+@pytest.mark.parametrize("outcome", ["blocked", "completed"])
+def test_respawn_guard_stale_rate_limit_stamp_superseded_by_later_run(
+    kanban_home, monkeypatch, outcome,
+):
+    """A rate-limit stamp left in ``last_failure_error`` must not park the card
+    once a later run ended ``blocked``/``completed`` (nothing else clears it)."""
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="stale-stamp", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome=?, status=?, ended_at=? WHERE id=?",
+            (outcome, outcome, 5_000_000, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("pid 1 exited rate-limited (quota wall) — requeued", tid),
+        )
+        conn.commit()
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
 @pytest.mark.parametrize(
     "error_text, expected",
     [
